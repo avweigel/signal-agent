@@ -1,0 +1,30 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+.python-version
+
+# Virtual environments
+.venv/
+venv/
+
+# Editor / OS metadata
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime data dirs (these belong in ~/workspace/agent-data/, but defensive)
+state/
+
+# Secret-bearing config files. Defense in depth: these are also named with
+# .local.json so the convention itself signals "local-only, not committed."
+*.local.json
+
+# Belt and suspenders for specific files in case they're ever created without
+# the .local suffix (older versions, examples, manual edits, etc.).
+calendars.json
+m365_config.json
+gmail-oauth-client.json
+gmail-token.json
+m365-token-cache.bin
+*.history-id.txt

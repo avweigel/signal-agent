@@ -1,0 +1,6 @@
+[
+  {
+    "name": "my-calendar",
+    "ical_url": "REPLACE_WITH_SECRET_ICAL_URL_FROM_GOOGLE_CAL_SETTINGS"
+  }
+]

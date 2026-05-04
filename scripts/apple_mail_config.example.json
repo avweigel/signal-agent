@@ -1,0 +1,4 @@
+{
+  "_help": "Find the UUID for the account you want to dump: `ls ~/Library/Mail/V10/`. Each UUID-named folder is one account; the one you want has *.mbox subfolders matching the account's mail folders. Copy this file to apple_mail_config.local.json and replace the placeholder.",
+  "account_uuid": "REPLACE_WITH_YOUR_APPLE_MAIL_ACCOUNT_UUID"
+}
