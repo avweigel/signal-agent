@@ -1,0 +1,6 @@
+{
+  "_help": "Identity info for the agent prompts. Used to teach the model which references are self-references (skip) vs. third-party (extract). Copy this file to agent_config.local.json (gitignored) and fill in.",
+  "user_full_name": "Your Full Name",
+  "user_first_name": "Your",
+  "user_emails": ["work@example.com", "personal@example.com"]
+}
