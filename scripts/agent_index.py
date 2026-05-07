@@ -772,6 +772,7 @@ def dedup_entities(
         "exact_collapsed": 0,
         "fuzzy_merged": 0,
         "redirected_to_existing": 0,
+        "consumed_db_short": 0,
         "ambiguous_flagged": 0,
         "output_count": 0,
     }
@@ -818,9 +819,12 @@ def dedup_entities(
             short_toks = token_cache.get(short_name) or []
             if not short_toks:
                 continue
-            new_cands: list[str] = []
-            db_cands: list[str] = []
-            # Candidates from other new names in this batch
+            # Build a UNION of long-form candidates across new + DB, deduplicated
+            # by name so the same string in both sources doesn't double-count
+            # (Bug 2: previously "Wyatt Korff" appearing in both new batch AND
+            # DB would be counted as 2 candidates, falsely flagging "Wyatt"
+            # as ambiguous).
+            long_form_candidates: set[str] = set()
             for long_name in new_names:
                 if long_name == short_name:
                     continue
@@ -828,23 +832,25 @@ def dedup_entities(
                 if len(long_toks) <= len(short_toks):
                     continue
                 if all(t in long_toks for t in short_toks):
-                    new_cands.append(long_name)
-            # Candidates from existing DB canonicals
+                    long_form_candidates.add(long_name)
             for long_name in db_names:
                 if long_name == short_name:
-                    continue  # exact match handled by upsert
+                    continue
                 long_toks = token_cache.get(long_name) or []
                 if len(long_toks) <= len(short_toks):
                     continue
                 if all(t in long_toks for t in short_toks):
-                    db_cands.append(long_name)
-            total_cands = len(new_cands) + len(db_cands)
-            if total_cands == 1:
-                if new_cands:
-                    merge_into_new[short_name] = new_cands[0]
+                    long_form_candidates.add(long_name)
+
+            if len(long_form_candidates) == 1:
+                only_match = next(iter(long_form_candidates))
+                if only_match in by_name:
+                    # In-batch consolidation
+                    merge_into_new[short_name] = only_match
                 else:
-                    redirect_to_db[short_name] = db_cands[0]
-            elif total_cands > 1:
+                    # Redirect to existing DB row
+                    redirect_to_db[short_name] = only_match
+            elif len(long_form_candidates) > 1:
                 ambiguous.add(short_name)
 
         # Apply in-batch fuzzy merges
@@ -885,6 +891,35 @@ def dedup_entities(
                 by_name[name].setdefault("metadata", {})["needs_disambiguation"] = True
                 stats["ambiguous_flagged"] += 1
 
+        # Bug 1 fix: detect new long-form entities that would unambiguously
+        # subsume an existing DB short-form. Tag them with `_consume_db_short`
+        # so upsert can update the existing row in place rather than insert
+        # a duplicate.
+        # Example: existing DB has "Dr. Shahzeidi"; new batch extracts "Dr.
+        # Shahriar Shahzeidi". The new entity tags _consume_db_short =
+        # "Dr. Shahzeidi" so upsert will UPDATE the existing row's
+        # canonical_name to the new long form and add the old short as alias.
+        for ent_name, ent in by_name.items():
+            new_toks = token_cache.get(ent_name) or _tokenize_name(ent_name)
+            if not new_toks:
+                continue
+            db_short_candidates: list[str] = []
+            for db_name in db_names:
+                if db_name == ent_name:
+                    continue  # exact match handled separately
+                db_toks = token_cache.get(db_name)
+                if db_toks is None:
+                    db_toks = _tokenize_name(db_name)
+                    token_cache[db_name] = db_toks
+                # We're looking for SHORT db_name that the new long-form ent_name subsumes
+                if len(db_toks) >= len(new_toks):
+                    continue
+                if all(t in new_toks for t in db_toks):
+                    db_short_candidates.append(db_name)
+            if len(db_short_candidates) == 1:
+                ent["_consume_db_short"] = db_short_candidates[0]
+                stats["consumed_db_short"] = stats.get("consumed_db_short", 0) + 1
+
         output.extend(by_name.values())
 
     stats["output_count"] = len(output)
@@ -912,10 +947,19 @@ def fetch_existing_canonicals(client) -> dict[str, set[str]]:
 # ---- DB writes ----------------------------------------------------------
 
 def upsert_entity(client, ent_type: str, canonical_name: str,
-                  new_aliases: list[str], new_metadata: dict) -> tuple[int, bool]:
-    """Find or create an entity. Merges aliases + metadata if it exists.
-    Returns (entity_id, was_newly_inserted).
+                  new_aliases: list[str], new_metadata: dict,
+                  consume_db_short: Optional[str] = None) -> tuple[int, str]:
+    """Find or create an entity. Three paths:
+      1. Exact (type, canonical_name) match in DB → merge aliases/metadata in place.
+      2. consume_db_short set → existing row keyed on (type, consume_db_short)
+         gets UPDATED: canonical_name promoted to the new long form, old
+         short_name added to aliases, aliases/metadata merged. Mentions
+         already attached to that row by foreign key — no migration needed.
+      3. No match → INSERT new row.
+
+    Returns (entity_id, action) where action ∈ {"merged", "consumed", "new"}.
     """
+    # 1. Exact match path
     existing = (
         client.schema(SCHEMA).table("entities")
         .select("*").eq("type", ent_type).eq("canonical_name", canonical_name)
@@ -930,15 +974,40 @@ def upsert_entity(client, ent_type: str, canonical_name: str,
                 "aliases": merged_aliases,
                 "metadata": merged_metadata,
             }).eq("id", e["id"]).execute()
-        return int(e["id"]), False
+        return int(e["id"]), "merged"
 
+    # 2. Consume existing short-form path
+    if consume_db_short:
+        existing_short = (
+            client.schema(SCHEMA).table("entities")
+            .select("*").eq("type", ent_type).eq("canonical_name", consume_db_short)
+            .execute()
+        )
+        if existing_short.data:
+            e = existing_short.data[0]
+            merged_aliases = sorted(set(
+                (e.get("aliases") or []) +
+                (new_aliases or []) +
+                [consume_db_short]  # old short-form preserved as alias
+            ))
+            merged_metadata = {**(e.get("metadata") or {}), **(new_metadata or {})}
+            client.schema(SCHEMA).table("entities").update({
+                "canonical_name": canonical_name,  # promote to new long form
+                "aliases": merged_aliases,
+                "metadata": merged_metadata,
+            }).eq("id", e["id"]).execute()
+            return int(e["id"]), "consumed"
+        # If the existing short row has vanished between dedup and upsert,
+        # fall through to INSERT.
+
+    # 3. Insert new
     result = client.schema(SCHEMA).table("entities").insert({
         "type": ent_type,
         "canonical_name": canonical_name,
         "aliases": new_aliases or [],
         "metadata": new_metadata or {},
     }).execute()
-    return int(result.data[0]["id"]), True
+    return int(result.data[0]["id"]), "new"
 
 
 def insert_mentions(client, entity_id: int, mentions: list[dict],
@@ -1092,7 +1161,9 @@ def main() -> int:
 
     anthropic_client = get_anthropic_client()
     cost_tracker = CostTracker(max_cost=args.max_cost)
-    supabase = get_supabase_client() if not args.dry_run else None
+    # Always fetch a Supabase client — even in dry-run we need it to read
+    # existing canonicals for cross-source dedup. Writes are still gated.
+    supabase = get_supabase_client()
 
     all_entities: list[dict] = []
     aborted_for_cost = False
@@ -1111,10 +1182,9 @@ def main() -> int:
         all_entities.extend(entities)
 
     # Fetch existing canonicals from DB so dedup can redirect short forms
-    # (e.g., mail "Wyatt" → existing "Wyatt Korff" from notes).
-    existing_canonicals = (
-        fetch_existing_canonicals(supabase) if supabase is not None else {}
-    )
+    # (e.g., mail "Wyatt" → existing "Wyatt Korff" from notes). Done in
+    # dry-run too — read-only, doesn't violate the no-write contract.
+    existing_canonicals = fetch_existing_canonicals(supabase)
 
     # Dedup
     deduped, dedup_stats = dedup_entities(all_entities, existing_canonicals)
@@ -1128,29 +1198,38 @@ def main() -> int:
     # Output
     inserted_entities_new = 0
     matched_existing = 0
+    consumed_existing = 0
     inserted_mentions = 0
     if args.dry_run:
         print()
         print("=" * 70)
         print(f"DRY RUN — {dedup_stats['output_count']} entities after dedup "
               f"(was {dedup_stats['input_count']})")
+        if dedup_stats.get("consumed_db_short", 0):
+            print(f"  → {dedup_stats['consumed_db_short']} would CONSUME existing DB short-form rows")
         print("=" * 70)
         for ent in deduped:
+            consume = ent.get("_consume_db_short")
+            if consume:
+                print(f"# CONSUME: existing DB '{consume}' will be promoted to '{ent['canonical_name']}'")
             print(json.dumps(ent, indent=2))
             print()
     else:
         for ent in deduped:
             try:
-                entity_id, was_new = upsert_entity(
+                entity_id, action = upsert_entity(
                     supabase,
                     ent.get("entity_type", ""),
                     ent.get("canonical_name", ""),
                     ent.get("aliases", []) or [],
                     ent.get("metadata", {}) or {},
+                    consume_db_short=ent.get("_consume_db_short"),
                 )
-                if was_new:
+                if action == "new":
                     inserted_entities_new += 1
-                else:
+                elif action == "consumed":
+                    consumed_existing += 1
+                else:  # merged
                     matched_existing += 1
                 inserted_mentions += insert_mentions(
                     supabase, entity_id,
@@ -1162,8 +1241,8 @@ def main() -> int:
                               ent.get("canonical_name"), e)
         print_index_summary(supabase)
         logging.info(
-            "DB writes: %d new, %d matched existing, %d mentions",
-            inserted_entities_new, matched_existing, inserted_mentions,
+            "DB writes: %d new, %d matched, %d consumed-short, %d mentions",
+            inserted_entities_new, matched_existing, consumed_existing, inserted_mentions,
         )
 
     finished = datetime.now(timezone.utc)
@@ -1183,14 +1262,15 @@ def main() -> int:
         "dedup_stats": dedup_stats,
         "entities_inserted_new": inserted_entities_new,
         "entities_matched_existing": matched_existing,
+        "entities_consumed_short": consumed_existing,
         "mentions_written": inserted_mentions,
         "cost": cost_tracker.summary(),
     }
     write_run_state("agent_index", summary)
     logging.info(
-        "Done. items=%d entities_extracted=%d new=%d matched=%d mentions=%d cost=$%.4f",
+        "Done. items=%d entities_extracted=%d new=%d matched=%d consumed=%d mentions=%d cost=$%.4f",
         len(items_paths), len(all_entities),
-        inserted_entities_new, matched_existing, inserted_mentions,
+        inserted_entities_new, matched_existing, consumed_existing, inserted_mentions,
         cost_tracker.total_cost,
     )
     return 0
